@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>反応テスト：音が鳴ったら離す</title>
+<style>
+  :root{
+    --bg:#0f172a; --card:#111827cc; --ink:#e5e7eb; --muted:#9ca3af;
+    --accent:#22d3ee; --ok:#34d399; --warn:#fbbf24; --err:#f87171;
+    --shadow:0 10px 30px rgba(0,0,0,.35);
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto,
+    "Hiragino Kaku Gothic ProN","Noto Sans JP","Yu Gothic","Meiryo",sans-serif;
+    background: radial-gradient(1200px 600px at 10% 0%, #0b122b 0%, #0f172a 40%, #0a0f22 100%);
+    color:var(--ink); min-height:100svh; display:grid; place-items:center; padding:24px;
+  }
+  .app{
+    width:min(780px,100%); background:linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.02));
+    border:1px solid rgba(255,255,255,.08); border-radius:16px; padding:24px; box-shadow:var(--shadow);
+    backdrop-filter: blur(6px);
+  }
+  h1{margin:0 0 6px; font-size:clamp(20px, 3.5vw, 28px)}
+  .subtitle{color:var(--muted); margin-bottom:16px}
+  .stage{
+    display:flex; flex-direction:column; align-items:center; justify-content:center; gap:18px;
+    padding:24px; border-radius:12px; background:var(--card); border:1px solid rgba(255,255,255,.08);
+  }
+  .big-btn{
+    appearance:none; border:none; border-radius:999px; padding:18px 28px; font-weight:800; font-size:18px; cursor:pointer;
+    color:#061017; background:linear-gradient(180deg, var(--accent), #14b8c5); box-shadow:0 10px 24px rgba(20,184,197,.35);
+    min-width:260px;
+  }
+  .big-btn:disabled{opacity:.6; cursor:not-allowed; box-shadow:none}
+  .status{min-height:24px; font-weight:800}
+  .status.ok{color:var(--ok)} .status.warn{color:var(--warn)} .status.err{color:var(--err)}
+  .row{display:flex; gap:10px; flex-wrap:wrap; align-items:center; justify-content:center}
+  .badges{display:flex; gap:8px; flex-wrap:wrap; color:var(--muted); font-size:14px}
+  .badge{padding:6px 10px; border-radius:999px; background:#0b1023; border:1px solid rgba(255,255,255,.12)}
+  .help{font-size:14px; color:var(--muted)}
+  .footer{margin-top:10px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px}
+</style>
+</head>
+<body>
+<main class="app" role="application" aria-labelledby="title">
+  <h1 id="title">反応テスト：音が鳴ったら離す</h1>
+  <div class="subtitle">ボタンを<strong>押し続け</strong>、<strong>音が鳴ったら離す</strong>。音が鳴ってから離すまでの時間を計測します（音の瞬間は画面に変化なし）。</div>
+
+  <section class="stage" aria-label="ゲームステージ">
+    <!-- 画面上の視覚合図は一切出さない -->
+    <div class="row">
+      <button id="holdBtn" class="big-btn" aria-pressed="false">押し続けてください（スペース可）</button>
+      <button id="retryBtn" class="big-btn" style="background:linear-gradient(180deg, #c6d3ff, #9fb3ff);" disabled>もう一度</button>
+    </div>
+    <div id="msg" class="status" aria-live="polite"></div>
+    <div class="badges">
+      <span class="badge" id="bestLabel">ベスト: —</span>
+      <span class="badge" id="lastLabel">前回: —</span>
+      <span class="badge" id="trialLabel">試行: 0</span>
+    </div>
+    <div class="help">※ 遅延はランダム（約1.5〜4秒）。音の前に離すと「フライング」。</div>
+  </section>
+
+  <div class="footer">
+    <span class="help">Made by 勝己</span>
+    <span class="help">スマホ：長押し／PC：マウス長押し・スペースキー</span>
+  </div>
+</main>
+
+<script>
+(function(){
+  const $ = s => document.querySelector(s);
+  const holdBtn = $('#holdBtn');
+  const retryBtn = $('#retryBtn');
+  const msg = $('#msg');
+  const bestLabel = $('#bestLabel'), lastLabel = $('#lastLabel'), trialLabel = $('#trialLabel');
+
+  // ===== シンプルなビープ音（<audio>）と自動再生制限対策 =====
+  // 約100ms・880Hzの短いWAV（Base64）
+  // 先頭無音なし・即頭から鳴るブザー（1kHz / 約120ms / WAV 16-bit PCM, mono, 44.1kHz）
+  // ===== Web Audio（ブザー合成・先頭無音なし・即発音） =====
+  let audioCtx = null;
+  let masterGain = null;
+
+  // AudioContext 準備
+  function ensureAudioContext(){
+    if(!audioCtx){
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if(!AC) return;
+      audioCtx = new AC();
+
+      // マスターゲイン（音量）を用意しておく（既定やや大きめ）
+      masterGain = audioCtx.createGain();
+      masterGain.gain.value = 0.6; // ← 音量（0.0〜1.0）。大きすぎる場合は下げてください
+      masterGain.connect(audioCtx.destination);
+    }
+    if(audioCtx.state === 'suspended') {
+      audioCtx.resume();
+    }
+  }
+
+  // 押し始めで“解錠”（自動再生制限対策：無音を一瞬鳴らす）
+  async function unlockAudio(){
+    ensureAudioContext();
+    if(!audioCtx) return;
+    try{
+      const dur = 0.03; // 30ms
+      const sr = audioCtx.sampleRate || 44100;
+      const buf = audioCtx.createBuffer(1, Math.ceil(dur*sr), sr); // 無音
+      const src = audioCtx.createBufferSource();
+      src.buffer = buf;
+      src.connect(masterGain);
+      src.start();
+      await new Promise(r => setTimeout(r, 40));
+    }catch(e){ /* noop */ }
+  }
+
+  // ブザー本体：square波 1000Hz / 120ms（先頭無音なし・即鳴動）
+  function playBeep(){
+    ensureAudioContext();
+    if(!audioCtx) return;
+
+    const t0 = audioCtx.currentTime;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+
+    // 音色・高さ
+    osc.type = 'square';         // ブザーっぽい角波
+    osc.frequency.setValueAtTime(1000, t0); // 1kHz（聞き取りやすい）
+
+    // クリック音抑制のエンベロープ（先頭から音が出るが破裂音は減らす）
+    const attack = 0.004;              // 4ms
+    const durationSec = 0.12;          // 120ms
+    gain.gain.setValueAtTime(0.0001, t0);
+    gain.gain.exponentialRampToValueAtTime(0.9, t0 + attack); // すぐ立ち上げ（≒即鳴動）
+    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + durationSec);
+
+    // マスターへ
+    osc.connect(gain).connect(masterGain);
+    osc.start(t0);
+    osc.stop(t0 + durationSec + 0.02);
+  }
+
+  // ===== 測定状態 =====
+  const BEST_KEY = 'reaction-sound-best';
+  let best = parseInt(localStorage.getItem(BEST_KEY) || '0', 10) || null;
+  let trials = 0;
+
+  let holding = false;   // いま押し続けているか
+  let sounded = false;   // 音が鳴ったか
+  let timerId = null;    // ランダム遅延タイマー
+  let startTime = 0;     // 音が鳴った瞬間（performance.now）
+  let last = null;       // 直近の記録（ms）
+
+  function updateBadges(){
+    bestLabel.textContent = 'ベスト: ' + (best ? (best + ' ms') : '—');
+    lastLabel.textContent = '前回: ' + (last != null ? (last + ' ms') : '—');
+    trialLabel.textContent = `試行: ${trials}`;
+  }
+
+  function flash(text, kind){
+    // ※ 音の瞬間は呼ばない（視覚変化禁止）
+    msg.textContent = text || '';
+    msg.className = 'status' + (kind ? ' ' + kind : '');
+  }
+
+  function clearTimer(){
+    if(timerId){ clearTimeout(timerId); timerId = null; }
+  }
+
+  function scheduleSound(){
+    // 1.5〜4.0秒のランダム遅延
+    const delay = Math.random() * 2500 + 1500;
+    timerId = setTimeout(()=>{
+      // 音の瞬間はUI更新しない
+      sounded = true;
+      startTime = performance.now();
+      playBeep();
+    }, delay);
+  }
+
+  function resetRound(){
+    clearTimer();
+    holding = false;
+    sounded = false;
+    flash('押し続けるとスタートします。', '');
+    holdBtn.setAttribute('aria-pressed','false');
+    retryBtn.disabled = true;
+  }
+
+  function startHold(){
+    if(holding) return;
+    holding = true;
+    holdBtn.setAttribute('aria-pressed','true');
+    retryBtn.disabled = true;
+
+    // オーディオ解錠（Windows/Edge/Chromeでも安全側）
+    unlockAudio();
+
+    clearTimer();
+    sounded = false;
+    flash('音が鳴るまで離さないでください…', '');
+    scheduleSound();
+  }
+
+  function endHold(){
+    if(!holding) return;
+    holding = false;
+    holdBtn.setAttribute('aria-pressed','false');
+    clearTimer();
+
+    if(!sounded){
+      // フライング
+      flash('フライング！ 音が鳴る前に離しました。', 'err');
+      retryBtn.disabled = false;
+      return;
+    }
+
+    const rt = Math.round(performance.now() - startTime);
+    last = rt;
+    trials++;
+    if(!best || rt < best){
+      best = rt;
+      localStorage.setItem(BEST_KEY, String(best));
+      flash(`🎉 ${rt} ms（ベスト更新！）`, 'ok');
+    }else{
+      flash(`${rt} ms`, 'ok');
+    }
+    retryBtn.disabled = false;
+    updateBadges();
+  }
+
+  // 初期表示
+  updateBadges();
+  resetRound();
+
+  // --- 入力ハンドリング（光合図版と同じ構成） ---
+  // 右クリック等のコンテキストメニュー抑止（長押しの邪魔防止）
+  document.addEventListener('contextmenu', e => e.preventDefault());
+
+  // スペースのスクロール抑止
+  window.addEventListener('keydown', e=>{
+    if(e.code === 'Space'){ e.preventDefault(); }
+  }, {passive:false});
+
+  // マウス
+  holdBtn.addEventListener('mousedown', (e)=>{ e.preventDefault(); startHold(); });
+  document.addEventListener('mouseup',   (e)=>{ if(holding) endHold(); });
+
+  // タッチ
+  holdBtn.addEventListener('touchstart', (e)=>{ e.preventDefault(); startHold(); }, {passive:false});
+  document.addEventListener('touchend',  (e)=>{ if(holding) endHold(); }, {passive:false});
+
+  // キーボード（スペース）
+  document.addEventListener('keydown', (e)=>{
+    if(e.code === 'Space' && !holding){ startHold(); }
+  });
+  document.addEventListener('keyup', (e)=>{
+    if(e.code === 'Space' && holding){ endHold(); }
+  });
+
+  // もう一度
+  retryBtn.addEventListener('click', resetRound);
+})();
+</script>
+</body>
+</html>
